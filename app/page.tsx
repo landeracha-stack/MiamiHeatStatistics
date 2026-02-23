@@ -20,6 +20,22 @@ const api = async (url: string) => {
 const wait = (ms: number) => new Promise(r => setTimeout(r, ms));
 const parseDate = (dateStr: string) => new Date(dateStr + 'T12:00:00');
 
+// Fetch ALL pages of a paginated endpoint
+const fetchAllPages = async (baseUrl: string): Promise<any[]> => {
+    let results: any[] = [];
+    let page = 1;
+    while (true) {
+        const sep = baseUrl.includes('?') ? '&' : '?';
+        const data = await api(`${baseUrl}${sep}per_page=100&page=${page}`);
+        const rows: any[] = data.data ?? [];
+        results = [...results, ...rows];
+        if (rows.length < 100) break;
+        page++;
+        await wait(150);
+    }
+    return results;
+};
+
 export default function HeatStats() {
     const [players, setPlayers] = useState<any[]>([]);
     const [lastGame, setLastGame] = useState<any>(null);
@@ -34,18 +50,24 @@ export default function HeatStats() {
     const [sortKey, setSortKey] = useState('pts');
 
     useEffect(() => {
-        if (!getApiKey()) { setHasKey(false); setLoadPlayers(false); setLoadGames(false); }
+        if (!getApiKey()) {
+            setHasKey(false);
+            setLoadPlayers(false);
+            setLoadGames(false);
+        }
     }, []);
 
-    // ── Load games + last game stats + standings ─────────────────
+    // ── Load games + last game stats + standings ──────────────────
     useEffect(() => {
         if (!hasKey) return;
         async function run() {
             try {
-                const gd = await api(
-                    `https://api.balldontlie.io/v1/games?team_ids[]=${HEAT_ID}&seasons[]=${SEASON}&per_page=100`
+                // Fetch ALL Heat games this season (paginated)
+                const allRows = await fetchAllPages(
+                    `https://api.balldontlie.io/v1/games?team_ids[]=${HEAT_ID}&seasons[]=${SEASON}`
                 );
-                const heatGames: any[] = (gd.data ?? []).filter((g: any) =>
+
+                const heatGames: any[] = allRows.filter((g: any) =>
                     Number(g.home_team?.id) === HEAT_ID || Number(g.visitor_team?.id) === HEAT_ID
                 );
                 setGames(heatGames);
@@ -56,17 +78,21 @@ export default function HeatStats() {
 
                 if (finished.length > 0) {
                     const total = finished.reduce((s: number, g: any) => {
-                        const score = Number(g.home_team?.id) === HEAT_ID ? g.home_team_score : g.visitor_team_score;
+                        const score = Number(g.home_team?.id) === HEAT_ID
+                            ? g.home_team_score : g.visitor_team_score;
                         return s + (Number(score) || 0);
                     }, 0);
                     setTeamPPG(total / finished.length);
 
                     const last = finished[0];
                     setLastGame(last);
-                    const sd = await api(`https://api.balldontlie.io/v1/stats?game_ids[]=${last.id}&per_page=100`);
+                    const sd = await api(
+                        `https://api.balldontlie.io/v1/stats?game_ids[]=${last.id}&per_page=100`
+                    );
                     setLastStats(
                         (sd.data ?? []).filter((s: any) =>
-                            Number(s.team?.id) === HEAT_ID && s.min && s.min !== '0' && s.min !== '00'
+                            Number(s.team?.id) === HEAT_ID &&
+                            s.min && s.min !== '0' && s.min !== '00'
                         )
                     );
                 }
@@ -78,7 +104,8 @@ export default function HeatStats() {
                         s.team?.full_name?.toLowerCase().includes('miami heat')
                     );
                     setStandings(hs ?? null);
-                } catch { /* optional */ }
+                } catch { /* standings optional */ }
+
             } catch (e) {
                 console.error('Games load error:', e);
             } finally {
@@ -88,57 +115,81 @@ export default function HeatStats() {
         run();
     }, [hasKey]);
 
-    // ── Load player stats from game logs ─────────────────────────
+    // ── Load player stats from ALL game logs ──────────────────────
     useEffect(() => {
         if (!hasKey) return;
         async function run() {
             try {
-                const gd = await api(
-                    `https://api.balldontlie.io/v1/games?team_ids[]=${HEAT_ID}&seasons[]=${SEASON}&per_page=100`
+                // Get ALL finished Heat game IDs this season (paginated)
+                const allRows = await fetchAllPages(
+                    `https://api.balldontlie.io/v1/games?team_ids[]=${HEAT_ID}&seasons[]=${SEASON}`
                 );
-                const finishedIds: number[] = (gd.data ?? [])
+
+                const today = new Date();
+                const finishedIds: number[] = allRows
                     .filter((g: any) =>
                         g.status === 'Final' &&
+                        parseDate(g.date) <= today &&
                         (Number(g.home_team?.id) === HEAT_ID || Number(g.visitor_team?.id) === HEAT_ID)
                     )
                     .map((g: any) => g.id);
 
-                if (finishedIds.length === 0) { setLoadPlayers(false); return; }
+                if (finishedIds.length === 0) {
+                    setLoadPlayers(false);
+                    return;
+                }
 
+                // Fetch stats for every finished game in chunks
                 let allStats: any[] = [];
                 const chunkSize = 10;
                 for (let i = 0; i < finishedIds.length; i += chunkSize) {
                     const chunk = finishedIds.slice(i, i + chunkSize);
                     const q = chunk.map((id: number) => `game_ids[]=${id}`).join('&');
                     try {
-                        const sd = await api(`https://api.balldontlie.io/v1/stats?${q}&per_page=100`);
-                        const heatRows = (sd.data ?? []).filter((s: any) =>
-                            Number(s.team?.id) === HEAT_ID &&
-                            s.min && s.min !== '0' && s.min !== '00'
-                        );
-                        allStats = [...allStats, ...heatRows];
-                    } catch { /* skip chunk */ }
+                        // Paginate stats within each chunk too
+                        let page = 1;
+                        while (true) {
+                            const sd = await api(
+                                `https://api.balldontlie.io/v1/stats?${q}&per_page=100&page=${page}`
+                            );
+                            const rows: any[] = sd.data ?? [];
+                            const heatRows = rows.filter((s: any) =>
+                                Number(s.team?.id) === HEAT_ID &&
+                                s.min && s.min !== '0' && s.min !== '00'
+                            );
+                            allStats = [...allStats, ...heatRows];
+                            if (rows.length < 100) break;
+                            page++;
+                        }
+                    } catch { /* skip failed chunk */ }
                     await wait(200);
                 }
 
+                // Aggregate per player
                 const map: Record<number, any> = {};
                 for (const s of allStats) {
                     const pid = s.player?.id;
                     if (!pid) continue;
                     if (!map[pid]) {
                         map[pid] = {
-                            player: s.player, games: 0,
+                            player: s.player,
+                            games: 0,
                             pts: 0, reb: 0, ast: 0, stl: 0, blk: 0,
                             fgm: 0, fga: 0, fg3m: 0, fg3a: 0, ftm: 0, fta: 0,
                         };
                     }
                     const p = map[pid];
                     p.games++;
-                    p.pts += Number(s.pts) || 0; p.reb += Number(s.reb) || 0;
-                    p.ast += Number(s.ast) || 0; p.stl += Number(s.stl) || 0;
-                    p.blk += Number(s.blk) || 0; p.fgm += Number(s.fgm) || 0;
-                    p.fga += Number(s.fga) || 0; p.fg3m += Number(s.fg3m) || 0;
-                    p.fg3a += Number(s.fg3a) || 0; p.ftm += Number(s.ftm) || 0;
+                    p.pts += Number(s.pts) || 0;
+                    p.reb += Number(s.reb) || 0;
+                    p.ast += Number(s.ast) || 0;
+                    p.stl += Number(s.stl) || 0;
+                    p.blk += Number(s.blk) || 0;
+                    p.fgm += Number(s.fgm) || 0;
+                    p.fga += Number(s.fga) || 0;
+                    p.fg3m += Number(s.fg3m) || 0;
+                    p.fg3a += Number(s.fg3a) || 0;
+                    p.ftm += Number(s.ftm) || 0;
                     p.fta += Number(s.fta) || 0;
                 }
 
@@ -147,15 +198,20 @@ export default function HeatStats() {
                     .map((p: any) => ({
                         player: p.player,
                         games_played: p.games,
-                        pts: p.pts / p.games, reb: p.reb / p.games,
-                        ast: p.ast / p.games, stl: p.stl / p.games,
+                        pts: p.pts / p.games,
+                        reb: p.reb / p.games,
+                        ast: p.ast / p.games,
+                        stl: p.stl / p.games,
                         blk: p.blk / p.games,
                         fg_pct: p.fga > 0 ? p.fgm / p.fga : 0,
                         fg3_pct: p.fg3a > 0 ? p.fg3m / p.fg3a : 0,
                         ft_pct: p.fta > 0 ? p.ftm / p.fta : 0,
-                        _fgm: p.fgm, _fga: p.fga, _fg3m: p.fg3m, _fg3a: p.fg3a, _ftm: p.ftm, _fta: p.fta,
+                        _fgm: p.fgm, _fga: p.fga,
+                        _fg3m: p.fg3m, _fg3a: p.fg3a,
+                        _ftm: p.ftm, _fta: p.fta,
                     }));
 
+                // Sort by games played descending so main rotation players appear first by default
                 setPlayers(merged);
             } catch (e) {
                 console.error('Player load error:', e);
@@ -190,7 +246,9 @@ export default function HeatStats() {
     let wins = 0, losses = 0;
     finishedGames.forEach((g: any) => {
         const home = Number(g.home_team?.id) === HEAT_ID;
-        const won = home ? g.home_team_score > g.visitor_team_score : g.visitor_team_score > g.home_team_score;
+        const won = home
+            ? g.home_team_score > g.visitor_team_score
+            : g.visitor_team_score > g.home_team_score;
         won ? wins++ : losses++;
     });
 
@@ -218,11 +276,16 @@ export default function HeatStats() {
     };
 
     const colHeaders = [
-        { label: 'Player', key: 'player' }, { label: 'GP', key: 'games_played' },
-        { label: 'PTS', key: 'pts' }, { label: 'REB', key: 'reb' },
-        { label: 'AST', key: 'ast' }, { label: 'STL', key: 'stl' },
-        { label: 'BLK', key: 'blk' }, { label: 'FG%', key: 'fg_pct' },
-        { label: '3P%', key: 'fg3_pct' }, { label: 'FT%', key: 'ft_pct' },
+        { label: 'Player', key: 'player' },
+        { label: 'GP', key: 'games_played' },
+        { label: 'PTS', key: 'pts' },
+        { label: 'REB', key: 'reb' },
+        { label: 'AST', key: 'ast' },
+        { label: 'STL', key: 'stl' },
+        { label: 'BLK', key: 'blk' },
+        { label: 'FG%', key: 'fg_pct' },
+        { label: '3P%', key: 'fg3_pct' },
+        { label: 'FT%', key: 'ft_pct' },
     ];
 
     const teamCards = [
@@ -258,7 +321,6 @@ export default function HeatStats() {
 
             <div style={{ maxWidth: 1300, margin: '0 auto', padding: '28px 20px' }}>
 
-                {/* No API key warning */}
                 {!hasKey && (
                     <div style={{ background: '#2a1a00', border: '1px solid #F9A01B', borderRadius: 8, padding: '20px 24px', color: '#F9A01B', marginBottom: 24, lineHeight: 1.8 }}>
                         <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>⚠️ API Key Required</div>
@@ -269,7 +331,6 @@ export default function HeatStats() {
                     </div>
                 )}
 
-                {/* TABS */}
                 {hasKey && (
                     <>
                         <div style={{ display: 'flex', gap: 10, marginBottom: 24, flexWrap: 'wrap' as const }}>
@@ -288,7 +349,7 @@ export default function HeatStats() {
                                     Player Season Averages — 2025-26
                                 </div>
                                 {loadPlayers
-                                    ? <div style={{ textAlign: 'center', padding: 60, color: '#888' }}>⏳ Loading player stats... (may take ~30s)</div>
+                                    ? <div style={{ textAlign: 'center', padding: 60, color: '#888' }}>⏳ Loading all game logs... (30-60 seconds)</div>
                                     : players.length === 0
                                         ? <div style={{ textAlign: 'center', padding: 60, color: '#888' }}>No player data found.</div>
                                         : <>
@@ -325,7 +386,7 @@ export default function HeatStats() {
                                                 </table>
                                             </div>
                                             <div style={{ color: '#555', fontSize: 12, marginTop: 8 }}>
-                                                Click column headers to sort · {players.length} players · Calculated from 2025-26 game logs
+                                                Click column headers to sort · {players.length} players · All {finishedGames.length} games through today
                                             </div>
                                         </>
                                 }
